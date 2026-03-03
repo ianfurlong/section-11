@@ -41,7 +41,7 @@ requests.post(
 
 The agent needs a `GITHUB_TOKEN` with `actions:write` scope on the data repo. For OpenClaw, this is already available if the skill uses GitHub Actions for sync.
 
-### Path 2: Local execution (Claude Code, Cowork, json-manual users)
+### Path 2: Local execution (Claude Code, Cowork, ChatGPT Codex App, json-manual users)
 
 For agents running locally with direct filesystem access.
 
