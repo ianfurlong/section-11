@@ -230,7 +230,7 @@ This is where the two paths diverge.
 
 #### Golden Path: Web chat setup (public repo)
 
-Walk them through setting up a ChatGPT or Claude project. If they use a different platform (Grok, Mistral, Gemini), adapt these instructions — the concept is the same: create a project, paste instructions, upload files.
+Walk them through setting up a ChatGPT or Claude project. If they use a different platform (Grok, Mistral, Gemini), adapt these instructions — the concept is the same: create a project, paste instructions, upload files. Note that Gemini's file access and web search behavior varies across Google accounts, so it may not work for everyone.
 
 **1. Create a Project:**
 
@@ -308,7 +308,7 @@ Tell them to upload these two files to their project's knowledge/files section:
 - **Claude Projects:** Upload to "Project Knowledge." Enable "Web search" in settings (required for JSON fetch).
 - **Grok:** Upload to "Sources" in Project configuration.
 - **Mistral (Le Chat):** Upload during project creation. Web access is available.
-- **Gemini Gems:** Paste Section 11 content into the instructions field and upload the dossier separately.
+- **Gemini Gems:** Paste Section 11 content into the instructions field and upload the dossier separately. *(Note: Gemini behavior varies across Google accounts — it may not work for everyone. See troubleshooting in the README if you run into issues.)*
 
 ---
 
