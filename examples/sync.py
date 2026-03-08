@@ -4,6 +4,12 @@ Intervals.icu → GitHub/Local JSON Export
 Exports training data for LLM access.
 Supports both automated GitHub sync and manual local export.
 
+Version 3.77 - Hash-based manifest for --update (all repo files tracked, no manual version bumps)
+  - --generate-manifest: maintainer command, walks repo, hashes all files, writes manifest.json
+  - --update: compares SHA256 hashes instead of version strings, detects new files automatically
+  - notify/GitHub Issues: hash-based change detection
+  - local_versions removed from .sync_config.json (local file hashes are the truth)
+
 Version 3.76 - Bug fixes: workout summary off-by-one, deload phase detection
   - Workout summary parser: trailing solo work step (final rep, no paired rest) was silently dropped
     in both _detect_alternating_in_nested (Pattern A) and _try_alternating_block (Pattern B).
@@ -107,7 +113,7 @@ class IntervalsSync:
     HISTORY_FILE = "history.json"
     UPSTREAM_REPO = "CrankAddict/section-11"
     CHANGELOG_FILE = "changelog.json"
-    VERSION = "3.76"
+    VERSION = "3.77"
 
     # Sport family mapping for per-sport monotony calculation
     # Multi-sport athletes get inflated total monotony when cross-training
@@ -4019,12 +4025,12 @@ class IntervalsSync:
             self._check_updates_via_changelog(headers)
     
     def _check_updates_via_manifest(self, manifest, headers):
-        """Create a GitHub Issue if manifest versions have changed."""
+        """Create a GitHub Issue if manifest file hashes have changed."""
         files = manifest.get("files", {})
         
-        # Generate deterministic fingerprint from sorted file:version pairs
-        version_pairs = sorted(f"{k}:{v.get('version', '?')}" for k, v in files.items())
-        fingerprint = "|".join(version_pairs)
+        # Generate deterministic fingerprint from sorted path:hash pairs
+        hash_pairs = sorted(f"{k}:{v.get('hash', '?')}" for k, v in files.items())
+        fingerprint = "|".join(hash_pairs)
         
         # Use a short hash for the issue title
         fp_hash = hashlib.md5(fingerprint.encode()).hexdigest()[:8]
@@ -4038,9 +4044,12 @@ class IntervalsSync:
         
         # Build issue body
         body = "## Section 11 Update Available\n\n"
-        body += "### Current versions:\n"
-        for name, info in sorted(files.items()):
-            body += f"- **{name}** v{info.get('version', '?')} — {info.get('description', '')}\n"
+        body += "### Tracked files:\n"
+        for path in sorted(files.keys()):
+            info = files[path]
+            desc = info.get("description", "")
+            desc_str = f" — {desc}" if desc else ""
+            body += f"- **{path}**{desc_str}\n"
         body += f"\n### Repository:\n"
         body += f"https://github.com/{self.UPSTREAM_REPO}\n"
         body += f"\n### Update instructions:\n"
@@ -5323,6 +5332,19 @@ class IntervalsSync:
 
 SECTION11_REPO_RAW = "https://raw.githubusercontent.com/CrankAddict/section-11/main"
 
+# Directories/files to exclude from manifest generation
+_MANIFEST_EXCLUDE_DIRS = {".git", ".github", "__pycache__", "node_modules"}
+_MANIFEST_EXCLUDE_FILES = {"manifest.json", ".DS_Store"}
+
+
+def _compute_file_hash(filepath):
+    """Compute SHA256 hash of a file. Returns hex digest string."""
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def _fetch_upstream_manifest():
     """Fetch manifest.json from the official Section 11 repo.
@@ -5338,34 +5360,108 @@ def _fetch_upstream_manifest():
         return None
 
 
-def _compare_versions(upstream_files, local_versions):
-    """Compare upstream manifest files against local versions.
-    Returns (needs_update, current) where each is a list of dicts."""
+def _compare_files(upstream_files, section11_dir):
+    """Compare upstream manifest hashes against local files in section11/.
+    Returns (needs_update, current) where each is a list of dicts.
+    Detects changed files (hash mismatch) and new files (missing locally)."""
     needs_update = []
     current = []
     
-    for name, info in upstream_files.items():
-        upstream_ver = info.get("version", "?")
-        local_ver = local_versions.get(name)
+    for path, info in upstream_files.items():
+        upstream_hash = info.get("hash", "")
         description = info.get("description", "")
-        path = info.get("path", "")
+        local_path = section11_dir / path
         
-        if local_ver is None:
+        if not local_path.exists():
             needs_update.append({
-                "name": name, "local": "?", "upstream": upstream_ver,
-                "description": description, "path": path
-            })
-        elif str(local_ver) != str(upstream_ver):
-            needs_update.append({
-                "name": name, "local": str(local_ver), "upstream": upstream_ver,
-                "description": description, "path": path
+                "path": path, "status": "new",
+                "description": description
             })
         else:
-            current.append({
-                "name": name, "version": upstream_ver, "description": description
-            })
+            try:
+                local_hash = _compute_file_hash(local_path)
+            except Exception:
+                local_hash = ""
+            
+            if local_hash != upstream_hash:
+                needs_update.append({
+                    "path": path, "status": "changed",
+                    "description": description
+                })
+            else:
+                current.append({
+                    "path": path, "description": description
+                })
     
     return needs_update, current
+
+
+def do_generate_manifest():
+    """
+    Generate manifest.json from the current repo directory.
+    
+    Maintainer command — walks the repo, computes SHA256 hashes for all files,
+    and writes manifest.json. Preserves existing descriptions.
+    Run from the repo root before committing.
+    """
+    repo_dir = Path.cwd()
+    manifest_path = repo_dir / "manifest.json"
+    
+    # Load existing manifest to preserve descriptions
+    existing_descriptions = {}
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, 'r') as f:
+                old_manifest = json.load(f)
+            for path, info in old_manifest.get("files", {}).items():
+                desc = info.get("description")
+                if desc:
+                    existing_descriptions[path] = desc
+        except Exception:
+            pass
+    
+    # Walk the repo and hash all files
+    files = {}
+    for root, dirs, filenames in os.walk(repo_dir):
+        # Exclude directories
+        dirs[:] = [d for d in dirs if d not in _MANIFEST_EXCLUDE_DIRS]
+        
+        for filename in filenames:
+            if filename in _MANIFEST_EXCLUDE_FILES:
+                continue
+            
+            filepath = Path(root) / filename
+            rel_path = filepath.relative_to(repo_dir).as_posix()
+            
+            # Skip hidden files
+            if any(part.startswith('.') for part in rel_path.split('/')):
+                continue
+            
+            try:
+                file_hash = _compute_file_hash(filepath)
+                entry = {"hash": file_hash}
+                
+                # Preserve existing description if present
+                if rel_path in existing_descriptions:
+                    entry["description"] = existing_descriptions[rel_path]
+                
+                files[rel_path] = entry
+            except Exception as e:
+                print(f"   ⚠️ Could not hash {rel_path}: {e}")
+    
+    # Sort by path for clean diffs
+    sorted_files = dict(sorted(files.items()))
+    
+    manifest = {
+        "scope": "All tracked files in the Section 11 repository. --update compares file hashes to detect changes and new files.",
+        "files": sorted_files
+    }
+    
+    with open(manifest_path, 'w') as f:
+        json.dump(manifest, f, indent=2)
+        f.write('\n')
+    
+    print(f"✅ manifest.json generated — {len(sorted_files)} files tracked")
 
 
 def do_init():
@@ -5374,7 +5470,7 @@ def do_init():
     
     Standalone function — does not require Intervals.icu credentials.
     Downloads the repo as a zip from GitHub, extracts to section11/,
-    and optionally populates local_versions from manifest.json.
+    and removes the bootstrap sync.py as the last step.
     """
     data_dir = Path.cwd()
     target_dir = data_dir / "section11"
@@ -5428,30 +5524,6 @@ def do_init():
     
     print(f"   ✅ Extracted to section11/")
     
-    # Read manifest.json if present, populate local_versions in .sync_config.json
-    manifest_path = target_dir / "manifest.json"
-    config_path = data_dir / ".sync_config.json"
-    
-    if manifest_path.exists():
-        try:
-            with open(manifest_path, 'r') as f:
-                manifest = json.load(f)
-            local_versions = {}
-            for name, info in manifest.get("files", {}).items():
-                local_versions[name] = info.get("version")
-            
-            # Load existing config (from --setup) or create new
-            config = {}
-            if config_path.exists():
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-            config["local_versions"] = local_versions
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
-            print(f"   Registered {len(local_versions)} file versions")
-        except Exception as e:
-            print(f"   ⚠️ Could not read manifest.json: {e}")
-    
     # Delete bootstrap sync.py — LAST STEP, only after extraction fully succeeded
     bootstrap_path = data_dir / "sync.py"
     repo_sync = target_dir / "examples" / "sync.py"
@@ -5480,12 +5552,11 @@ def do_update():
     Check for updates and pull changed files from the official Section 11 repo.
     
     Standalone function — does not require Intervals.icu credentials.
-    Fetches manifest.json from GitHub, compares versions against local_versions
-    in .sync_config.json, and downloads only changed files after confirmation.
+    Fetches manifest.json from GitHub, compares file hashes against local copies
+    in section11/, and downloads only changed or new files after confirmation.
     """
     data_dir = Path.cwd()
     target_dir = data_dir / "section11"
-    config_path = data_dir / ".sync_config.json"
     
     # Guard: section11/ must exist
     if not target_dir.exists():
@@ -5502,19 +5573,8 @@ def do_update():
     
     upstream_files = manifest.get("files", {})
     
-    # Load local_versions from .sync_config.json
-    local_versions = {}
-    config = {}
-    if config_path.exists():
-        try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            local_versions = config.get("local_versions", {})
-        except Exception:
-            pass
-    
-    # Compare versions
-    needs_update, current = _compare_versions(upstream_files, local_versions)
+    # Compare hashes against local files
+    needs_update, current = _compare_files(upstream_files, target_dir)
     
     # Nothing to update
     if not needs_update:
@@ -5525,17 +5585,19 @@ def do_update():
     print(f"\n   Updates available ({len(needs_update)} file{'s' if len(needs_update) != 1 else ''}):\n")
     
     # Calculate column widths for alignment
-    name_width = max(len(u["name"]) for u in needs_update)
+    path_width = max(len(u["path"]) for u in needs_update)
     
     for u in needs_update:
-        name_padded = u["name"].ljust(name_width)
-        print(f"   {name_padded}  {u['local']} → {u['upstream']}   {u['description']}")
+        path_padded = u["path"].ljust(path_width)
+        desc = f"   {u['description']}" if u.get('description') else ""
+        print(f"   {path_padded}  [{u['status']}]{desc}")
     
     if current:
         print(f"\n   Already current ({len(current)}):\n")
-        for c in current:
-            name_padded = c["name"].ljust(name_width)
-            print(f"   ✅ {name_padded}  {c['version']}")
+        for c in current[:10]:  # Show first 10 to avoid wall of text
+            print(f"   ✅ {c['path']}")
+        if len(current) > 10:
+            print(f"   ... and {len(current) - 10} more")
     
     # Ask for confirmation
     print()
@@ -5562,7 +5624,7 @@ def do_update():
             resp = requests.get(file_url, timeout=30)
             resp.raise_for_status()
             
-            # Ensure target directory exists
+            # Ensure target directory exists (for new files in new directories)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             
             # Write to temp file, then atomic replace
@@ -5572,10 +5634,10 @@ def do_update():
             os.replace(str(tmp_path), str(target_path))
             
             updated.append(u)
-            print(f"   ✅ {u['name']}  {u['local']} → {u['upstream']}")
+            print(f"   ✅ {u['path']}  [{u['status']}]")
         except Exception as e:
             failed.append(u)
-            print(f"   ❌ {u['name']}  failed: {e}")
+            print(f"   ❌ {u['path']}  failed: {e}")
             # Clean up temp file if it exists
             tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
             if tmp_path.exists():
@@ -5594,17 +5656,6 @@ def do_update():
     except Exception as e:
         print(f"   ⚠️ Could not save manifest.json locally: {e}")
     
-    # Update local_versions for successfully updated files
-    if updated:
-        for u in updated:
-            local_versions[u["name"]] = u["upstream"]
-        config["local_versions"] = local_versions
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(config, f, indent=2)
-        except Exception as e:
-            print(f"   ⚠️ Could not save local_versions: {e}")
-    
     # Summary
     if failed:
         print(f"\n   Updated {len(updated)} file{'s' if len(updated) != 1 else ''}, {len(failed)} failed")
@@ -5617,18 +5668,23 @@ def notify_if_updates_available():
     Silent, rate-limited check for Section 11 updates during normal sync runs.
     
     Runs at most once per 24 hours. Fetches manifest.json from upstream,
-    compares against local_versions, prints a one-line notification if
-    updates are available. Completely silent on any failure — this must
-    never interrupt a sync run.
+    compares file hashes against local section11/ files, prints a one-line
+    notification if updates are available. Completely silent on any failure —
+    this must never interrupt a sync run.
     """
     try:
         config_path = Path.cwd() / ".sync_config.json"
+        section11_dir = Path.cwd() / "section11"
         
-        # Load config
-        if not config_path.exists():
+        # Only relevant for local setups with section11/
+        if not section11_dir.exists():
             return
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+        
+        # Load config for rate limiting
+        config = {}
+        if config_path.exists():
+            with open(config_path, 'r') as f:
+                config = json.load(f)
         
         # Rate limit: once per 24 hours
         last_check = config.get("last_manifest_check")
@@ -5640,18 +5696,13 @@ def notify_if_updates_available():
             except (ValueError, TypeError):
                 pass  # Malformed timestamp, proceed with check
         
-        # Check if section11/ exists (only relevant for local setups)
-        local_versions = config.get("local_versions")
-        if not local_versions:
-            return  # No local_versions means not a local setup, skip
-        
         # Fetch manifest
         manifest = _fetch_upstream_manifest()
         if not manifest:
             return  # Silent failure
         
-        # Compare
-        needs_update, _ = _compare_versions(manifest.get("files", {}), local_versions)
+        # Compare hashes against local files
+        needs_update, _ = _compare_files(manifest.get("files", {}), section11_dir)
         
         # Update timestamp regardless of result
         config["last_manifest_check"] = datetime.now().isoformat()
@@ -5777,6 +5828,7 @@ def main():
     parser.add_argument("--week-start", choices=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
                         default=None, help="Training week start day (default: mon, or from config)")
     parser.add_argument("--generate-history", action="store_true", help="Force generate history.json (pulls up to 3 years)")
+    parser.add_argument("--generate-manifest", action="store_true", help="Generate manifest.json from repo files (maintainer use)")
     parser.add_argument("--lockfile", action="store_true", help="Prevent overlapping runs (recommended for automated timers)")
     
     args = parser.parse_args()
@@ -5816,6 +5868,10 @@ def main():
     
     if args.update:
         do_update()
+        return
+    
+    if args.generate_manifest:
+        do_generate_manifest()
         return
     
     # Lockfile: prevent overlapping runs (for automated timers)
