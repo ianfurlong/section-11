@@ -46,6 +46,7 @@ Both methods use the same `sync.py` script and produce these files:
 |------|---------|--------------|
 | `latest.json` | Current 7-day training data for AI consumption | Yes |
 | `history.json` | Longitudinal data — daily (90d), weekly (180d), monthly (3y) | Yes |
+| `intervals.json` | Per-interval segment data for recent structured sessions | Yes |
 | `ftp_history.json` | FTP tracking for Benchmark Index | Yes |
 | `archive/` | Timestamped snapshots (auto-sync only) | Yes |
 
@@ -93,6 +94,14 @@ history.json
 ├── daily_90d            → Day-by-day detail (last 90 days)
 ├── weekly_180d          → Week-by-week (last 180 days)
 └── monthly_1y/2y/3y     → Month-by-month (up to 3 years)
+
+intervals.json (on-demand — load when analysing activities with has_intervals: true)
+├── generated_at         → Timestamp
+├── version              → sync.py version
+└── activities[]         → Per-activity interval segments
+    ├── activity_id      → Matches id in latest.json recent_activities
+    ├── interval_summary → Group summary (e.g., "4x 9m56s 259w")
+    └── intervals[]      → WORK + RECOVERY segments with power, HR, cadence, zone, decoupling
 ```
 
 ### Derived Metrics
