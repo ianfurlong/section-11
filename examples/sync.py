@@ -4,6 +4,10 @@ Intervals.icu → GitHub/Local JSON Export
 Exports training data for LLM access.
 Supports both automated GitHub sync and manual local export.
 
+Version 3.82 - Interval-level data: intervals.json with per-segment metrics for structured sessions.
+  Pre-filter via interval_summary + sport family whitelist (cycling, run, ski, rowing, swim).
+  Incremental cache (72h scan, 7-day retention, first-run backfill). has_intervals flag in latest.json.
+
 Version 3.81 - Feel removed from readiness decision signal chain.
   Feel is a retrospective activity-level field, not a morning readiness marker.
   A feel value from days ago should not drive today's go/modify/skip recommendation.
@@ -30,35 +34,9 @@ Version 3.78 - Bug fix: weekly history aligned to configured week start (was har
   - Update checker: removed manifest.json fallback from _check_for_updates(), changelog.json only
   - Log rotation: sync.log trimmed to 200 lines when over 1MB
 
-Version 3.77 - Hash-based manifest for --update (all repo files tracked, no manual version bumps)
-  - --generate-manifest: maintainer command, walks repo, hashes all files, writes manifest.json
-  - --update: compares SHA256 hashes instead of version strings, detects new files automatically
-  - notify/GitHub Issues: hash-based change detection
-  - local_versions removed from .sync_config.json (local file hashes are the truth)
-
-Version 3.76 - Bug fixes: workout summary off-by-one, deload phase detection
-  - Workout summary parser: trailing solo work step (final rep, no paired rest) was silently dropped
-    in both _detect_alternating_in_nested (Pattern A) and _try_alternating_block (Pattern B).
-    e.g., 13×30s reported as 12×30s. Both paths now consume the orphaned trailing rep.
-  - Phase detection Path C: retrospective deload when plan coverage is 0%.
-    Existing paths required planned_tss_delta (Path A) or ctl_slope > 1.0 (Path B, unrealistic
-    during deload). Path C: completed-week TSS ≤ 80% of prior-3-week avg + prior build evidence.
-    Build evidence uses [-4:-1] slices to exclude the current deload week from averages.
-    No hard-day gate — deload weeks legitimately contain reduced-volume quality sessions.
-    Validated against 26 weeks: catches all confirmed deloads, zero false positives.
-
-Version 3.75 - Working directory awareness + local setup
-  - Data files (history.json, ftp_history.json) now write to caller's working directory, not script's directory
-  - Enables running sync.py from a parent directory: python section11/examples/sync.py --output latest.json
-  - No change for users who run sync.py from its own directory
-  - Migration: if you run sync.py from a parent directory, move history.json and ftp_history.json to your working directory
-  - --init flag: download the full Section 11 repo to section11/ for local-only setups (no GitHub needed)
-  - --update flag: check for updates from official repo, show diff, pull changed files after confirmation
-  - Manifest check on sync runs: once per 24h, silent notification if updates available
-  - --lockfile flag: prevent overlapping runs for automated timers (stale detection via PID + 10-min age)
-  - Update notifications: manifest.json preferred, changelog.json fallback (backward compatible)
-  - Bootstrap flow: python sync.py --setup → python sync.py --init → use section11/examples/sync.py going forward
-  
+Version 3.77 - Hash-based manifest (--generate-manifest, --update uses SHA256, no manual version bumps)
+Version 3.76 - Bug fixes: workout summary off-by-one trailing rep, deload phase detection Path C
+Version 3.75 - Working directory awareness, --init/--update/--lockfile flags, local sync pipeline
 Version 3.73 - Phase detection: Stream 2 windows aligned to training week, configurable week start (config/env/CLI)
 Version 3.72 - Readiness Decision: pre-computed go/modify/skip via P0-P3 priority ladder, 7 signals, phase modifiers
 Version 3.71 - HRRc integration: 7d/28d aggregate trend in capability namespace (display only)
@@ -107,7 +85,15 @@ class IntervalsSync:
     HISTORY_FILE = "history.json"
     UPSTREAM_REPO = "CrankAddict/section-11"
     CHANGELOG_FILE = "changelog.json"
-    VERSION = "3.81"
+    VERSION = "3.82"
+    INTERVALS_FILE = "intervals.json"
+
+    # Sport families eligible for interval-level data extraction.
+    # Only structured sessions in these families are worth fetching
+    # per-interval detail for. Walk, strength, yoga, other excluded.
+    INTERVAL_SPORT_FAMILIES = {"cycling", "run", "ski", "rowing", "swim"}
+    INTERVAL_SCAN_HOURS = 72    # Only scan recent activities for new intervals
+    INTERVAL_RETENTION_DAYS = 7  # Keep cached intervals for 7 days
 
     # Sport family mapping for per-sport monotony calculation
     # Multi-sport athletes get inflated total monotony when cross-training
@@ -182,6 +168,139 @@ class IntervalsSync:
             return []
         except Exception:
             return []
+    
+    def _fetch_activity_intervals(self, activity_id: str) -> List[Dict]:
+        """Fetch interval segments for a single activity. Returns icu_intervals list or empty list on failure."""
+        url = f"{self.INTERVALS_BASE_URL}/activity/{activity_id}"
+        headers = {
+            "Authorization": f"Basic {self.intervals_auth}",
+            "Accept": "application/json"
+        }
+        try:
+            response = requests.get(url, headers=headers, params={"intervals": "true"})
+            response.raise_for_status()
+            data = response.json()
+            intervals = data.get("icu_intervals", [])
+            if isinstance(intervals, list):
+                return intervals
+            return []
+        except Exception as e:
+            if self.debug:
+                print(f"    ⚠️  Could not fetch intervals for {activity_id}: {e}")
+            return []
+    
+    def _generate_intervals(self, activities: List[Dict]) -> set:
+        """
+        Generate intervals.json with incremental caching.
+        
+        First run (no cache): scans full retention window (7 days) to backfill.
+        Subsequent runs: scans recent activities (72h) for new sessions only.
+        Fetches per-interval data for new qualifying activities, merges
+        with cached data, and purges entries older than 7 days.
+        
+        Returns set of activity IDs that have interval data (for has_intervals flag).
+        """
+        now = datetime.now()
+        retention_cutoff = (now - timedelta(days=self.INTERVAL_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        
+        # Load existing cache
+        intervals_path = self.data_dir / self.INTERVALS_FILE
+        cached = {"activities": []}
+        first_run = not intervals_path.exists()
+        if not first_run:
+            try:
+                with open(intervals_path, 'r') as f:
+                    cached = json.load(f)
+            except Exception as e:
+                if self.debug:
+                    print(f"    ⚠️  Could not read intervals.json: {e}")
+                cached = {"activities": []}
+                first_run = True
+        
+        # First run: backfill full retention window (7 days). Subsequent: scan 72h only.
+        if first_run:
+            scan_cutoff = retention_cutoff
+            print("    First run — scanning 7 days for interval data...")
+        else:
+            scan_cutoff = (now - timedelta(hours=self.INTERVAL_SCAN_HOURS)).strftime("%Y-%m-%d")
+        
+        cached_ids = {a["activity_id"] for a in cached.get("activities", [])}
+        
+        # Filter activities to scan window + sport family whitelist + interval_summary non-null
+        candidates = []
+        for act in activities:
+            date_str = act.get("start_date_local", "")[:10]
+            if date_str < scan_cutoff:
+                continue
+            act_type = act.get("type", "")
+            family = self.SPORT_FAMILIES.get(act_type)
+            if family not in self.INTERVAL_SPORT_FAMILIES:
+                continue
+            if not act.get("interval_summary"):
+                continue
+            act_id = act.get("id")
+            if act_id in cached_ids:
+                continue
+            candidates.append(act)
+        
+        # Fetch intervals for new qualifying activities
+        new_entries = []
+        for act in candidates:
+            act_id = act.get("id")
+            print(f"    Fetching intervals for {act.get('name', act_id)}...")
+            raw_intervals = self._fetch_activity_intervals(act_id)
+            if not raw_intervals:
+                continue
+            
+            # Format interval segments
+            segments = []
+            for iv in raw_intervals:
+                segment = {
+                    "type": iv.get("type"),
+                    "label": iv.get("group_id"),
+                    "duration_secs": iv.get("elapsed_time"),
+                    "avg_power": iv.get("average_watts"),
+                    "max_power": iv.get("max_watts"),
+                    "avg_hr": iv.get("average_heartrate"),
+                    "max_hr": iv.get("max_heartrate"),
+                    "avg_cadence": iv.get("average_cadence"),
+                    "zone": iv.get("zone"),
+                    "w_bal": iv.get("w_bal"),
+                    "training_load": iv.get("training_load"),
+                    "decoupling": iv.get("decoupling"),
+                }
+                # Strip None values to keep output lean
+                segment = {k: v for k, v in segment.items() if v is not None}
+                segments.append(segment)
+            
+            if segments:
+                new_entries.append({
+                    "activity_id": act_id,
+                    "date": act.get("start_date_local", "")[:10],
+                    "type": act.get("type", "Unknown"),
+                    "name": act.get("name", ""),
+                    "interval_summary": act.get("interval_summary"),
+                    "intervals": segments
+                })
+        
+        if new_entries:
+            print(f"    ✅ Fetched intervals for {len(new_entries)} new activit{'y' if len(new_entries) == 1 else 'ies'}")
+        
+        # Merge: keep cached entries within retention window + new entries
+        retained = [a for a in cached.get("activities", []) if a.get("date", "") >= retention_cutoff]
+        all_entries = retained + new_entries
+        
+        # Build intervals.json
+        self._intervals_data = {
+            "generated_at": now.isoformat(),
+            "version": self.VERSION,
+            "scan_hours": self.INTERVAL_SCAN_HOURS,
+            "retention_days": self.INTERVAL_RETENTION_DAYS,
+            "activities": all_entries
+        }
+        
+        # Return all activity IDs that have interval data
+        return {a["activity_id"] for a in all_entries}
     
     def _fetch_today_wellness(self) -> Dict:
         """
@@ -579,6 +698,15 @@ class IntervalsSync:
         # History confidence (v3.3.0)
         history_info = self._get_history_confidence()
         
+        # Generate interval-level data (v3.82)
+        # Uses the already-fetched activity list — no extra listing API calls.
+        # Pre-filters by sport family whitelist + interval_summary non-null.
+        # Incremental: only fetches intervals for new qualifying activities.
+        print("Checking for interval data...")
+        interval_activity_ids = self._generate_intervals(activities_display)
+        if interval_activity_ids:
+            print(f"  📊 {len(interval_activity_ids)} activit{'y' if len(interval_activity_ids) == 1 else 'ies'} with interval data")
+        
         data = {
             "READ_THIS_FIRST": {
                 "instruction_for_ai": "DO NOT calculate totals from individual activities. Use the pre-calculated values in 'summary', 'weekly_summary', and 'derived_metrics' sections below. These are already computed accurately from the API data.",
@@ -631,7 +759,7 @@ class IntervalsSync:
                 }
             },
             "derived_metrics": derived_metrics,
-            "recent_activities": self._format_activities(activities_display, anonymize),
+            "recent_activities": self._format_activities(activities_display, anonymize, interval_activity_ids),
             "wellness_data": self._format_wellness(wellness),
             "planned_workouts": formatted_planned_workouts,
             "workout_summary_stats": getattr(self, '_summary_stats', {}),
@@ -4099,8 +4227,9 @@ class IntervalsSync:
             if self.debug:
                 print(f"  Could not create update issue: {e}")
     
-    def _format_activities(self, activities: List[Dict], anonymize: bool = False) -> List[Dict]:
+    def _format_activities(self, activities: List[Dict], anonymize: bool = False, interval_activity_ids: set = None) -> List[Dict]:
         """Format activities for LLM analysis"""
+        interval_activity_ids = interval_activity_ids or set()
         formatted = []
         for i, act in enumerate(activities):
             avg_power = (act.get("average_watts") or act.get("avg_watts") or 
@@ -4207,7 +4336,8 @@ class IntervalsSync:
                 "elevation_m": act.get("total_elevation_gain"),
                 "feel": act.get("feel"),
                 "rpe": act.get("icu_rpe"),
-                "zone_distribution": zone_dist
+                "zone_distribution": zone_dist,
+                "has_intervals": act.get("id", f"unknown_{i+1}") in interval_activity_ids
             }
 
             # Parse NOTE: lines from activity description (v0.3 — coach annotations)
@@ -6096,6 +6226,14 @@ def main():
         print_summary()
         print(f"\n💡 Tip: Paste contents to AI, or upload the file directly")
         
+        # === SAVE INTERVALS.JSON (local mode) ===
+        intervals_data = getattr(sync, '_intervals_data', None)
+        if intervals_data and intervals_data.get("activities"):
+            intervals_path = sync.data_dir / sync.INTERVALS_FILE
+            with open(intervals_path, 'w') as f:
+                json.dump(intervals_data, f, indent=2, default=str)
+            print(f"   📊 intervals.json saved ({len(intervals_data['activities'])} activities)")
+        
         # === AUTO HISTORY GENERATION (local mode) ===
         if sync.should_generate_history():
             try:
@@ -6118,6 +6256,20 @@ def main():
         print(f"   {raw_url}")
         print(f"\n💬 Example prompt:")
         print(f'   "Analyze my training data from {raw_url}"')
+        
+        # === PUBLISH INTERVALS.JSON (GitHub mode) ===
+        intervals_data = getattr(sync, '_intervals_data', None)
+        if intervals_data and intervals_data.get("activities"):
+            # Save locally for incremental cache on next run
+            intervals_path = sync.data_dir / sync.INTERVALS_FILE
+            with open(intervals_path, 'w') as f:
+                json.dump(intervals_data, f, indent=2, default=str)
+            try:
+                sync.publish_to_github(intervals_data, filepath="intervals.json",
+                                       commit_message=f"Update intervals.json - {datetime.now().strftime('%Y-%m-%d')}")
+                print(f"   📊 intervals.json pushed ({len(intervals_data['activities'])} activities)")
+            except Exception as e:
+                print(f"   ⚠️ intervals.json push failed (non-critical): {e}")
         
         # === AUTO HISTORY GENERATION (Sundays/Mondays, first two runs after midnight) ===
         if sync.should_generate_history():

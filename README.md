@@ -97,11 +97,12 @@ Read data using the first method that works:
 1. **Connected repo/filesystem** — If data files are available via connector (GitHub, Google Drive, OneDrive) or local filesystem, read latest.json and history.json directly
 2. **URL fetch** — Fetch https://raw.githubusercontent.com/[USERNAME]/[REPO]/main/latest.json (append ?date= with today's date). Same for history.json
 3. If activities don't match today's date, re-fetch or re-read before concluding no data exists
+4. Load intervals.json when analysing a specific activity with `has_intervals: true` — use for interval compliance, pacing, cardiac drift, recovery quality
 
 Do NOT ask me for data — read or fetch it yourself.
 
 ## SOURCE HIERARCHY:
-1. **JSON data** — Current metrics from latest.json (READ/FETCH FIRST) + longitudinal data from history.json
+1. **JSON data** — Current metrics from latest.json (READ/FETCH FIRST) + longitudinal data from history.json + interval detail from intervals.json (on-demand)
 2. **Section 11 protocol** (attached) — Coaching rules, thresholds, metric hierarchy
 3. **Dossier** — Athlete profile, zones, goals
 4. **Report templates** — Fetch from https://github.com/CrankAddict/section-11/tree/main/examples/reports if not attached
@@ -465,6 +466,10 @@ The script generates `history.json` with tiered granularity: daily (90 days), we
 
 The script maintains `ftp_history.json` to track indoor and outdoor FTP changes over time, enabling Benchmark Index calculation. See [examples/json-auto-sync/SETUP.md](examples/json-auto-sync/SETUP.md#ftp-history-tracking) for details.
 
+### Interval-Level Data
+
+The script generates `intervals.json` with per-interval segment data (power, HR, cadence, zone, decoupling, W'bal) for recent structured sessions. Activities with interval data are flagged with `has_intervals: true` in `latest.json`. Incrementally cached with a 72h scan window and 7-day retention. Only activities in whitelisted sport families (cycling, run, ski, rowing, swim) with detected interval structure are included.
+
 ### Update Notifications
 
 The sync script checks for upstream updates using `manifest.json`. **GitHub Actions users** get a GitHub Issue created in their data repo when updates are available. **Local users** see a one-line notification during sync runs (once per day) and can run `--update` to pull changes. See [json-local-sync](examples/json-local-sync/SETUP.md#staying-up-to-date) for details.
@@ -555,6 +560,7 @@ The software is provided "as is", without warranty of any kind.
 - [x] Longitudinal history generation (tiered granularity)
 - [x] Upstream update notifications via GitHub Issues
 - [x] Capability metrics (aggregate durability, dual-timeframe TID)
+- [x] Interval-level data (per-segment power, HR, cadence, decoupling for structured sessions)
 
 ---
 

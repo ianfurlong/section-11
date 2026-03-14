@@ -184,6 +184,7 @@ Walk them through:
 - The workflow run should show a green ✓
 - A `latest.json` file should now exist in the repo root with their training data
 - A `history.json` file should also appear
+- An `intervals.json` file may appear if the athlete has recent structured interval sessions
 
 If the run fails (red ✗), ask them to click into the failed run and share the error message so you can help troubleshoot.
 
@@ -300,11 +301,12 @@ Read data using the first method that works:
 1. **Connected repo/filesystem** — If data files are available via connector (GitHub, Google Drive, OneDrive) or local filesystem, read latest.json and history.json directly
 2. **URL fetch** — Fetch https://raw.githubusercontent.com/[USERNAME]/[REPO]/main/latest.json (append ?date= with today's date). Same for history.json
 3. If activities don't match today's date, re-fetch or re-read before concluding no data exists
+4. Load intervals.json when analysing a specific activity with `has_intervals: true` — use for interval compliance, pacing, cardiac drift, recovery quality
 
 Do NOT ask me for data — read or fetch it yourself.
 
 ## SOURCE HIERARCHY:
-1. **JSON data** — Current metrics from latest.json (READ/FETCH FIRST) + longitudinal data from history.json
+1. **JSON data** — Current metrics from latest.json (READ/FETCH FIRST) + longitudinal data from history.json + interval detail from intervals.json (on-demand)
 2. **Section 11 protocol** (attached) — Coaching rules, thresholds, metric hierarchy
 3. **Dossier** — Athlete profile, zones, goals
 4. **Report templates** — Fetch from https://github.com/CrankAddict/section-11/tree/main/examples/reports if not attached
@@ -459,10 +461,11 @@ For local setups, the AI coach reads files from the data directory instead of fe
 ## DATA ACCESS:
 1. Read latest.json from the data directory
 2. Read history.json from the data directory
-3. Read protocol from section11/SECTION_11.md
-4. Read report templates from section11/examples/reports/
-5. Read workout templates from section11/examples/workout-library/WORKOUT_REFERENCE.md
-6. If data files appear stale, ask the athlete to run sync
+3. Read intervals.json when analysing a specific activity with has_intervals: true
+4. Read protocol from section11/SECTION_11.md
+5. Read report templates from section11/examples/reports/
+6. Read workout templates from section11/examples/workout-library/WORKOUT_REFERENCE.md
+7. If data files appear stale, ask the athlete to run sync
 
 Do NOT fetch from URLs — all files are local.
 

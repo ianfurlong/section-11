@@ -119,6 +119,10 @@ jobs:
               git add latest.json
               echo "✅ Staged latest.json"
             fi
+            if [ -f intervals.json ]; then
+              git add intervals.json
+              echo "✅ Staged intervals.json"
+            fi
             
             # Now pull - autostash will safely stash staged changes
             git pull --rebase --autostash origin main
