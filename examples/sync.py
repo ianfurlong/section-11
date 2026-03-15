@@ -93,7 +93,7 @@ class IntervalsSync:
     HISTORY_FILE = "history.json"
     UPSTREAM_REPO = "CrankAddict/section-11"
     CHANGELOG_FILE = "changelog.json"
-    VERSION = "3.83"
+    VERSION = "3.84"
     INTERVALS_FILE = "intervals.json"
 
     # Sport families eligible for interval-level data extraction.
@@ -4278,6 +4278,7 @@ class IntervalsSync:
     def _format_activities(self, activities: List[Dict], anonymize: bool = False, interval_activity_ids: set = None) -> List[Dict]:
         """Format activities for LLM analysis"""
         interval_activity_ids = interval_activity_ids or set()
+        chat_notes_cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         formatted = []
         for i, act in enumerate(activities):
             avg_power = (act.get("average_watts") or act.get("avg_watts") or 
@@ -4388,9 +4389,10 @@ class IntervalsSync:
                 "has_intervals": act.get("id", f"unknown_{i+1}") in interval_activity_ids
             }
 
-            # Parse NOTE: lines from activity description (v0.3 — coach annotations)
+            # Pass through full description + extract NOTE: lines for push.py round-trip (v3.84)
             raw_desc = act.get("description") or ""
             if raw_desc.strip():
+                activity["description"] = raw_desc.strip()
                 coach_notes = []
                 for line in raw_desc.split("\n"):
                     stripped = line.strip()
@@ -4399,12 +4401,13 @@ class IntervalsSync:
                         if note_text:
                             coach_notes.append(note_text)
                     elif stripped:
-                        break  # stop at first non-NOTE, non-blank line
+                        break  # NOTE: lines only extracted from top of description
                 if coach_notes:
                     activity["coach_notes"] = coach_notes
 
-            # Fetch activity chat messages if available (v0.3 — --chat annotations)
-            if act.get("has_messages"):
+            # Fetch activity chat messages for recent activities (v3.84 — unconditional, 7-day window)
+            act_date = act.get("start_date_local", "")[:10]
+            if act_date >= chat_notes_cutoff:
                 activity_id = act.get("id")
                 if activity_id:
                     notes = self._get_activity_messages(activity_id)
